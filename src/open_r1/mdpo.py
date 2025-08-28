@@ -25,9 +25,9 @@ import transformers
 from datasets import load_dataset
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
-from open_r1.configs import MDPOConfig
-from open_r1.mdpo.mdpo_trainer import MDPOTrainer
-from open_r1.rewards import (
+from src.open_r1.configs import MDPOConfig
+from src.open_r1.mdpo.mdpo_trainer import MDPOTrainer
+from src.open_r1.rewards import (
     accuracy_reward,
     code_reward,
     format_reward,
@@ -42,9 +42,9 @@ from open_r1.rewards import (
     countdown_reward,
     sudoku_reward, verify_sudoku
 )
-from open_r1.utils import get_tokenizer
-from open_r1.utils.callbacks import get_callbacks
-from open_r1.utils.wandb_logging import init_wandb_training
+from src.open_r1.utils import get_tokenizer
+from src.open_r1.utils.callbacks import get_callbacks
+from src.open_r1.utils.wandb_logging import init_wandb_training
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 from llada.modeling_llada import LLaDAModelLM
 import deepspeed
@@ -120,7 +120,7 @@ class GRPOScriptArguments(ScriptArguments):
     num_train_samples: int = field(default=3000, metadata={"help": "Number of training samples"})
     incremental_training: bool = field(default=False, metadata={"help": "Whether incrementally select ICFW data"})
     mixture_data: bool = field(default=False, metadata={"help": "Sample the data in a mixture of settings way"})
-
+    ab_path: str = field(default=None, metadata={"help": "Path to preprocessed answer backslide data"})
 
 def main(script_args, training_args, model_args):
     # Set seed for reproducibility
@@ -371,6 +371,7 @@ def main(script_args, training_args, model_args):
         processing_class=tokenizer,
         incremental_training=script_args.incremental_training,
         mixture_data=script_args.mixture_data,
+        ab_path=script_args.ab_path
     )
 
     ###############

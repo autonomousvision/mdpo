@@ -66,7 +66,7 @@ from itertools import groupby
 from math_verify.parser import get_extraction_regexes, extract_match
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
-from open_r1.utils.trainer_utils import profiling_context, CustomDistributedSampler
+from src.open_r1.utils.trainer_utils import profiling_context, CustomDistributedSampler
 import importlib.metadata
 from transformers.training_args import OptimizerNames, ParallelMode, TrainingArguments
 import numpy as np
@@ -553,6 +553,7 @@ class MDPOTrainer(Trainer):
             peft_config: Optional["PeftConfig"] = None,
             incremental_training: bool = False,
             mixture_data: bool = False,
+            ab_path: str = None,
     ):
         # Args
         if args is None:
@@ -702,6 +703,7 @@ class MDPOTrainer(Trainer):
             optimizers=optimizers,
         )
         self.incremental_training = incremental_training
+        self.ab_path = ab_path
         self.mixture_data = mixture_data
         self.current_data = []
         if incremental_training:
@@ -1215,14 +1217,12 @@ class MDPOTrainer(Trainer):
 
         # Train!
         logger.info("***** Running training *****")
-        logger.info(f"  Num examples = {num_examples:,}")
         logger.info(f"  Num Epochs = {num_train_epochs:,}")
         logger.info(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size:,}")
         if self.args.per_device_train_batch_size != self._train_batch_size:
             logger.info(f"  Training with DataParallel so batch size has been adjusted to: {self._train_batch_size:,}")
         logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_train_batch_size:,}")
         logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-        logger.info(f"  Total optimization steps = {max_steps:,}")
         logger.info(f"  Number of trainable parameters = {get_model_param_count(model, trainable_only=True):,}")
 
         self.state.epoch = 0
@@ -1271,18 +1271,32 @@ class MDPOTrainer(Trainer):
 
         for epoch in range(epochs_trained, num_train_epochs):
             if self.incremental_training:
-                data_per_rank, wrong_per_rank = self._incremental_data_selection()
-                dist.barrier()
-                data_gathered = gather_object(data_per_rank)
-                wrong_gathered = gather_object(wrong_per_rank)
-                # for old_data in self.current_data:
-                #     for wrong_data in wrong_gathered:
-                #         if old_data["prompt"][0]["content"] == wrong_data["prompt"][0]["content"] and old_data["diffusion_steps"] == wrong_data["diffusion_steps"] and old_data["block_length"] == wrong_data["block_length"]:
-                #             data_gathered.append(wrong_data)
-                self.current_data = data_gathered
-                if dist.get_rank() == 0:
-                    pd.DataFrame({"Problem": [a["prompt"][0]["content"] for a in data_gathered],
-                                  "Solution": [a["solution"] for a in data_gathered]}).to_csv(os.path.join(args.output_dir, f"data_epoch_{epoch+1}.csv"))
+                if epoch == 0:
+                    if os.path.exists(self.ab_path):
+                        ab_data = pd.read_csv(self.ab_path)
+                        self.current_data = []
+                        for row in range(ab_data.shape[0]):
+                            self.current_data.append({"prompt": [{"role": "user", "content": ab_data.loc[row, "Problem"]}],
+                                                      "solution": ab_data.loc[row, "Solution"],
+                                                      "diffusion_steps": ab_data.loc[row, "diffusion_steps"] if "diffusion_steps" in ab_data.columns else None,
+                                                      "block_length": ab_data.loc[
+                                                          row, "block_length"] if "block_length" in ab_data.columns else None,
+                                                      })
+                    else:
+                        raise FileExistsError("Ab_path doesn't exist")
+                else:
+                    data_per_rank, wrong_per_rank = self._incremental_data_selection()
+                    dist.barrier()
+                    data_gathered = gather_object(data_per_rank)
+                    wrong_gathered = gather_object(wrong_per_rank)
+                    # for old_data in self.current_data:
+                    #     for wrong_data in wrong_gathered:
+                    #         if old_data["prompt"][0]["content"] == wrong_data["prompt"][0]["content"] and old_data["diffusion_steps"] == wrong_data["diffusion_steps"] and old_data["block_length"] == wrong_data["block_length"]:
+                    #             data_gathered.append(wrong_data)
+                    self.current_data = data_gathered
+                    if dist.get_rank() == 0:
+                        pd.DataFrame({"Problem": [a["prompt"][0]["content"] for a in data_gathered],
+                                      "Solution": [a["solution"] for a in data_gathered]}).to_csv(os.path.join(args.output_dir, f"data_epoch_{epoch+1}.csv"))
                 self.train_dataset = Dataset.from_list(self.current_data)
                 train_dataloader = self.get_train_dataloader()
                 if self.is_fsdp_xla_v2_enabled:
@@ -1301,13 +1315,15 @@ class MDPOTrainer(Trainer):
                     len_dataloader,
                     max_steps,
                 ) = self.set_initial_training_values(args, train_dataloader, total_train_batch_size)
+                self.state.compute_steps(args, max_steps)
+                self.state.init_training_references(self, train_dataloader, max_steps, num_train_epochs, trial)
                 if dist.get_rank() == 0:
                     logger.info(f"***** Epoch {epoch+1} *****")
                     logger.info(f"  Num examples = {num_examples:,}")
+                    logger.info(f"  Total optimization steps = {max_steps:,}")
             epoch_dataloader = train_dataloader
             if hasattr(epoch_dataloader, "set_epoch"):
                 epoch_dataloader.set_epoch(epoch)
-
             # Reset the past mems state at the beginning of each epoch if necessary.
             if args.past_index >= 0:
                 self._past = None

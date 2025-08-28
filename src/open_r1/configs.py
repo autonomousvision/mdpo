@@ -15,8 +15,8 @@
 
 from dataclasses import dataclass, field
 from typing import Optional
-from open_r1.mdpo import MDPOConfig as BasedMDPOConfig
-from open_r1.diff_grpo.config import DiffuGRPOConfig as BaseDiffuGRPOConfig
+from src.open_r1.mdpo import MDPOConfig as BasedMDPOConfig
+from src.open_r1.diff_grpo.config import DiffuGRPOConfig as BaseDiffuGRPOConfig
 import trl
 
 
