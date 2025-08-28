@@ -45,14 +45,15 @@ CC=${gcc path} CUDA_HOME=${CUDA_HOME} CXX=${g++ path} accelerate launch --config
 --sample_train_steps 8 
 --max_prompt_length 320 
 --diffusion_steps 128 
---remask_strategy random 
---num_train_samples 3500 
+--remask_strategy low_confidence 
+--num_train_samples 40000 
 --system_prompt "Let's think step by step and output the final answer within \\boxed{}."
 --incremental_training true
 --mixture_data true
+--ab_path ab_samples/ab_from_40k_epoch_1.csv
 ```
-where N is the number of GPUs you want to use, and you might need to set your gcc and g++ path probably to run on the cluster. Here we only randomly pick 3500 samples from the datasets and it takes ~30 hours to train.
-Note that when you turn on "incremental_training", it will start with inference over the training examples first to filter the Answer Backslide samples. And then only the Answer Backslide samples are used to train the model.
+where N is the number of GPUs you want to use, and you might need to set your gcc and g++ path probably to run on the cluster. To reproduce our results, we could randomly pick 40000 samples from the datasets.
+Note that when you turn on "incremental_training", it will start with inference over the training examples first to filter the Answer Backslide samples. And then only the Answer Backslide samples are used to train the model. To save the repetitive data filtering time, we directly provide the pre-filtered data samples by --ab_path with data in [ab_samples](./ab_samples). In this way, the training should take ~30 hours to complete.
 
 ## 📚Citation
 If you find this work useful, please consider citing our paper. 🥰
