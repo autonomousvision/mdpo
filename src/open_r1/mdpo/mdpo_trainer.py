@@ -6,7 +6,7 @@ import textwrap
 import math
 from collections import defaultdict
 from typing import Any, Callable, Optional, Sized, Union
-
+from src.mdlm_generation_utils import diffusion_generate
 import pandas as pd
 import torch.distributed as dist
 import time
@@ -252,113 +252,6 @@ def find_subtensor_mask(tensor, subtensor, method='sliding'):
                 mask[i:i + len(subtensor)] = 1
 
         return mask
-
-@torch.no_grad()
-def generate(model, prompt, prompt_mask=None, steps=64, block_length=32, gen_length=128, tokenizer=None, temperature=0.,
-             cfg_scale=0., remasking='low_confidence', mask_id=126336, overtime_conf=False):
-    '''
-    Optimized version of the generate function.
-    '''
-    if overtime_conf:
-        remasking = "low_confidence"
-    model.eval()
-    # Use mixed precision for faster computation
-    with torch.amp.autocast("cuda", enabled=True):
-        x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=prompt.dtype, device=prompt.device)
-        if prompt_mask is not None:
-            attn_mask = torch.full((prompt_mask.shape[0], prompt_mask.shape[1] + gen_length), 1, dtype=prompt_mask.dtype, device=prompt_mask.device)
-            attn_mask[:, :prompt_mask.shape[1]] = prompt_mask.clone()
-        else:
-            attn_mask = None
-        x[:, :prompt.shape[1]] = prompt.clone()
-
-        prompt_index = (x != mask_id)
-
-        assert gen_length % block_length == 0
-        num_blocks = gen_length // block_length
-
-        # Adjust steps if needed
-        steps_per_block = max(1, steps // num_blocks)
-        all_inputs = []
-        all_outputs = []
-        all_confidence = []
-        overtime_confidence = torch.zeros_like(x, dtype=torch.float32)
-        for num_block in range(num_blocks):
-            start_idx = prompt.shape[1] + num_block * block_length
-            end_idx = prompt.shape[1] + (num_block + 1) * block_length
-
-            block_mask_index = (x[:, start_idx:end_idx] == mask_id)
-            num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
-
-            for i in range(steps_per_block):
-                mask_index = (x == mask_id)
-                all_inputs.append(x.clone().detach().cpu()[:, prompt_mask.shape[1]:])
-                # Handle classifier-free guidance more efficiently
-                if cfg_scale > 0.:
-                    un_x = x.clone()
-                    un_x[prompt_index] = mask_id
-                    x_ = torch.cat([x, un_x], dim=0)
-
-                    # Get logits in a single forward pass
-                    logits = model(x_, attention_mask=attn_mask).logits
-                    logits, un_logits = torch.chunk(logits, 2, dim=0)
-                    logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
-                else:
-                    logits = model(x, attention_mask=attn_mask).logits
-
-                # Apply Gumbel noise for sampling
-                logits_with_noise = add_gumbel_noise(logits, temperature)
-                x0 = torch.argmax(logits_with_noise, dim=-1)
-                # Handle remasking strategy
-                if remasking == 'low_confidence':
-                    # Use float32 instead of float64 for better performance
-                    p = F.softmax(logits, dim=-1)
-                    x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(-1)
-                elif remasking == 'random':
-                    if torch.distributed.get_rank() == 0:
-                        x0_p = torch.rand(x0.shape, device=x0.device)
-                    else:
-                        x0_p = torch.empty(x0.shape, device=x0.device)
-                    # torch.distributed.broadcast(x0_p, src=0)
-                    broadcast(x0_p, 0)
-                else:
-                    raise NotImplementedError(remasking)
-                all_confidence.append(x0_p.clone().cpu())
-                # Ensure we don't process tokens beyond the current block
-                x0_p[:, end_idx:] = -np.inf
-
-                # Update masked tokens
-                x0 = torch.where(mask_index, x0, x).to(x.dtype)
-                all_outputs.append(x0.clone().detach().cpu()[:, prompt_mask.shape[1]:])
-                confidence = torch.where(mask_index, x0_p, torch.tensor(-np.inf, device=x0.device))
-
-                # conf_diff = torch.where((confidence - overtime_confidence) == -np.inf, 0.0,
-                #                                        confidence - overtime_confidence)
-
-                # Select tokens to transfer based on confidence
-                for j in range(confidence.shape[0]):
-                    num_tokens = num_transfer_tokens[j, i].item()
-                    if overtime_conf:
-                        _, select_indices = torch.topk(confidence[j], k=num_transfer_tokens[j, i:].sum().item())
-                        x[j, select_indices] = x0[j, select_indices]
-                        overtime_confidence[j, select_indices] = confidence[j, select_indices].clone()
-                        # if (x[j,:] == mask_id).sum() <= 0:
-                        if i != (steps_per_block - 1):
-                            overtime_conf_wo_zeros = \
-                                torch.where(overtime_confidence == 0.0, 1.0, overtime_confidence)[j]
-                            num_tokens_to_mask = num_transfer_tokens[j, i + 1:].sum().item()
-                            _, mask_select_indices = torch.topk(overtime_conf_wo_zeros, k=num_tokens_to_mask,
-                                                                largest=False)
-                            if len(mask_select_indices) == 0:
-                                break
-                            x[j, mask_select_indices] = mask_id
-                    else:
-                        if num_tokens > 0:
-                            _, select_indices = torch.topk(confidence[j], k=num_tokens)
-                            x[j, select_indices] = x0[j, select_indices]
-
-        model.train()
-        return all_inputs, all_outputs, all_confidence
 
 class RepeatRandomSampler(Sampler):
     """
@@ -732,8 +625,8 @@ class MDPOTrainer(Trainer):
         # transformers if num_generations exceeds per_device_train_batch_size. We could skip it if we use vLLM, but
         # it's safer to set it in all cases.
         set_seed(args.seed, device_specific=True)
-        self.generation_fn = partial(generate, gen_length=self.max_completion_length,  tokenizer=self.processing_class, temperature=args.temperature, cfg_scale=0.,
-                                     remasking=self.args.remask_strategy, mask_id=processing_class.mask_token_id, overtime_conf=self.args.overtime_conf)
+        self.generation_fn = partial(diffusion_generate, gen_length=self.max_completion_length, temperature=self.temperature,
+                                     conf_alg=self.args.conf_alg, mask_id=processing_class.mask_token_id, rcr=self.args.rcr, top_k=self.args.top_k, top_p=self.args.top_p)
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
         # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
@@ -837,17 +730,12 @@ class MDPOTrainer(Trainer):
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     @profiling_decorator
-    def _get_per_token_logps(self, model, input_ids, target_ids, attention_mask, logits_to_keep):
+    def _get_per_token_logps(self, model, input_ids, target_ids, attention_mask):
         logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-        # logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
-
-        target_ids = target_ids[:, -logits_to_keep:]
+        target_ids = target_ids[:, -self.max_completion_length:]
         # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
         # See https://github.com/huggingface/trl/issues/2770
-        logits = logits[:, -logits_to_keep:]
-        # Divide logits by sampling temperature.
-        # See https://huggingface.co/blog/the_n_implementation_details_of_rlhf_with_ppo#policy-training-implementation-details
-        # add epsilon here to avoid 0 division
+        logits = logits[:, -self.max_completion_length:]
         logits = logits / (self.temperature + torch.finfo(logits.dtype).eps)
         return selective_log_softmax(logits, target_ids)  # compute logprobs for the input tokens
 
@@ -895,7 +783,7 @@ class MDPOTrainer(Trainer):
         # diffusion_steps, block_length = self.args.diffusion_steps, self.args.block_length
         diffusion_steps, block_length = all_diffusion_steps, all_block_lengths
         with unwrap_model_for_generation(self.model_wrapped, self.accelerator, gather_deepspeed3_params=False) as unwrapped_model:
-            all_steps_input_ids, all_steps_output_completion_ids, all_confidence = self.generation_fn(unwrapped_model, prompt_ids, prompt_mask, steps=diffusion_steps,
+            _, all_steps_output_completion_ids, all_confidence, all_steps_input_ids = self.generation_fn(unwrapped_model, prompt_ids, prompt_mask=prompt_mask, steps=diffusion_steps,
                                      block_length=block_length)
         # Compute prompt length and extract completion ids
         completion_ids = all_steps_output_completion_ids[-1]
@@ -912,12 +800,12 @@ class MDPOTrainer(Trainer):
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
         # Concatenate prompt_mask with completion_mask for logit computation
-
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
         all_rewards = []
         # last_block_steps = self.args.diffusion_steps // (
         #         self.args.max_completion_length // self.args.block_length)
         for t_completion_ids in all_steps_output_completion_ids:
+            # replace out vocab token with eos here becauseof this issue https://github.com/DreamLM/Dream/issues/54
+            t_completion_ids = torch.where(t_completion_ids >= len(self.processing_class), self.processing_class.eos_token_id, t_completion_ids)
             t_completions_texts = self.processing_class.batch_decode(t_completion_ids, skip_special_tokens=True)
             t_completions = []
             if is_conversational(inputs[0]):
@@ -987,6 +875,9 @@ class MDPOTrainer(Trainer):
         # self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item()
         if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
             prompts_to_log = gather_object(prompts_text)
+            # replace out vocab token with eos here becauseof this issue https://github.com/DreamLM/Dream/issues/54
+            completion_ids = torch.where(completion_ids >= len(self.processing_class),
+                                           self.processing_class.eos_token_id, completion_ids)
             completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
             completions_to_log = gather_object(completions_text)
             solutions_to_log = gather_object(solutions_text)
@@ -1021,7 +912,6 @@ class MDPOTrainer(Trainer):
             "all_steps_completion_ids": all_steps_output_completion_ids,
             "all_confidence": all_confidence,
             "advantages": advantages,
-            "logits_to_keep": logits_to_keep,
         }
 
     def split_into_micro_batches(self, traj):
@@ -1042,20 +932,19 @@ class MDPOTrainer(Trainer):
                 [prompt_ids, completion_ids.to(prompt_ids.dtype).to(prompt_ids.device)], dim=-1)
             input_mask = torch.concatenate(
                 [prompt_mask, torch.ones_like(input_answer_ids).to(prompt_mask.dtype).to(prompt_mask.device)], dim=-1)
-            conf = traj["all_confidence"][step][:, -traj["logits_to_keep"]:].to(input_ids.device)
+            conf = traj["all_confidence"][step].to(input_ids.device)
             with torch.no_grad():
                 if self.beta != 0.0:
-                    ref_per_token_logps = self._get_per_token_logps(self.ref_model, input_ids, target_ids, input_mask, traj["logits_to_keep"])
+                    ref_per_token_logps = self._get_per_token_logps(self.ref_model, input_ids, target_ids, input_mask)
                 else:
                     ref_per_token_logps = None
             yield {
                 "input_ids": input_ids,
                 "input_mask": input_mask,
                 "target_ids": target_ids,
-                "advantages": (advantages[:, step: step+1]).expand_as(input_ids).to(input_ids.device),
+                "advantages": (advantages[:, step: step+1]).expand_as(input_answer_ids).to(input_ids.device),
                 "conf": conf,
                 "ref_per_token_logps": ref_per_token_logps,
-                "logits_to_keep": traj["logits_to_keep"],
                 "step": torch.ones_like(input_ids) * step
             }
 
@@ -1271,19 +1160,16 @@ class MDPOTrainer(Trainer):
 
         for epoch in range(epochs_trained, num_train_epochs):
             if self.incremental_training:
-                if epoch == 0:
-                    if os.path.exists(self.ab_path):
-                        ab_data = pd.read_csv(self.ab_path)
-                        self.current_data = []
-                        for row in range(ab_data.shape[0]):
-                            self.current_data.append({"prompt": [{"role": "user", "content": ab_data.loc[row, "Problem"]}],
-                                                      "solution": ab_data.loc[row, "Solution"],
-                                                      "diffusion_steps": ab_data.loc[row, "diffusion_steps"] if "diffusion_steps" in ab_data.columns else None,
-                                                      "block_length": ab_data.loc[
-                                                          row, "block_length"] if "block_length" in ab_data.columns else None,
-                                                      })
-                    else:
-                        raise FileExistsError("Ab_path doesn't exist")
+                if epoch == 0 and self.ab_path is not None and os.path.exists(self.ab_path):
+                    ab_data = pd.read_csv(self.ab_path)
+                    self.current_data = []
+                    for row in range(ab_data.shape[0]):
+                        self.current_data.append({"prompt": [{"role": "user", "content": ab_data.loc[row, "Problem"]}],
+                                                  "solution": ab_data.loc[row, "Solution"],
+                                                  "diffusion_steps": ab_data.loc[row, "diffusion_steps"] if "diffusion_steps" in ab_data.columns else None,
+                                                  "block_length": ab_data.loc[
+                                                      row, "block_length"] if "block_length" in ab_data.columns else None,
+                                                  })
                 else:
                     data_per_rank, wrong_per_rank = self._incremental_data_selection()
                     dist.barrier()
@@ -1359,17 +1245,17 @@ class MDPOTrainer(Trainer):
             for _ in range(total_updates):
                 update_step += 1
                 # Evaluation every 100 step
-                if update_step % 100 == 0:
-                    # pass
-                    correct_per_rank = self.evaluate()
-                    dist.barrier()
-                    cpu_pg = dist.new_group(backend="gloo")  # 1-line fix
-                    world_size = dist.get_world_size()
-                    gathered_corrects = [None] * world_size if dist.get_rank() == 0 else None
-                    dist.gather_object(correct_per_rank, gathered_corrects, dst=0, group=cpu_pg)
-                    if dist.get_rank() == 0:
-                        wandb.log({"eval/accuracy": sum([len(corrects) for corrects in gathered_corrects]) / len(self.eval_dataset)})
-                    dist.destroy_process_group(cpu_pg)
+                # if update_step % 100 == 0:
+                #     # pass
+                #     correct_per_rank = self.evaluate()
+                #     dist.barrier()
+                #     cpu_pg = dist.new_group(backend="gloo")  # 1-line fix
+                #     world_size = dist.get_world_size()
+                #     gathered_corrects = [None] * world_size if dist.get_rank() == 0 else None
+                #     dist.gather_object(correct_per_rank, gathered_corrects, dst=0, group=cpu_pg)
+                #     if dist.get_rank() == 0:
+                #         wandb.log({"eval/accuracy": sum([len(corrects) for corrects in gathered_corrects]) / len(self.eval_dataset)})
+                #     dist.destroy_process_group(cpu_pg)
                 num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder
                 batch_samples, num_items_in_batch = self.get_batch_samples(epoch_iterator, num_batches)
                 for i, batch in enumerate(batch_samples):
@@ -1503,18 +1389,18 @@ class MDPOTrainer(Trainer):
                     if is_torch_xla_available():
                         xm.mark_step()
                     break
-            if epoch == (num_train_epochs - 1):
-                # pass
-                correct_per_rank = self.evaluate()
-                dist.barrier()
-                cpu_pg = dist.new_group(backend="gloo")  # 1-line fix
-                world_size = dist.get_world_size()
-                gathered_corrects = [None] * world_size if dist.get_rank() == 0 else None
-                dist.gather_object(correct_per_rank, gathered_corrects, dst=0, group=cpu_pg)
-                if dist.get_rank() == 0:
-                    wandb.log({"eval/accuracy": sum([len(corrects) for corrects in gathered_corrects]) / len(
-                        self.eval_dataset)})
-                dist.destroy_process_group(cpu_pg)
+            # if epoch == (num_train_epochs - 1):
+            #     # pass
+            #     correct_per_rank = self.evaluate()
+            #     dist.barrier()
+            #     cpu_pg = dist.new_group(backend="gloo")  # 1-line fix
+            #     world_size = dist.get_world_size()
+            #     gathered_corrects = [None] * world_size if dist.get_rank() == 0 else None
+            #     dist.gather_object(correct_per_rank, gathered_corrects, dst=0, group=cpu_pg)
+            #     if dist.get_rank() == 0:
+            #         wandb.log({"eval/accuracy": sum([len(corrects) for corrects in gathered_corrects]) / len(
+            #             self.eval_dataset)})
+            #     dist.destroy_process_group(cpu_pg)
             if step < 0:
                 logger.warning(
                     "There seems not to be a single sample in your epoch_iterator, stopping training at step"
@@ -1601,11 +1487,8 @@ class MDPOTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GDPOTrainer does not support returning outputs")
-        logits_to_keep = inputs["logits_to_keep"]  # we only need to compute the logits for the completion tokens
         # refer to the guideline here https://github.com/ML-GSAI/LLaDA/blob/main/GUIDELINES.md
-        per_token_logps = self._get_per_token_logps(model, inputs["input_ids"], inputs["target_ids"], inputs["input_mask"], logits_to_keep)
-        # p_mask = torch.ones((logits.shape[0], logits_to_keep), device=logits.device) * ((1 - eps) * ((step.unsqueeze(-1) + 1) / self.args.diffusion_steps) + eps)
-        # per_token_logps = self._get_per_token_logps(model, input_ids, target_ids, input_mask, logits_to_keep)
+        per_token_logps = self._get_per_token_logps(model, inputs["input_ids"], inputs["target_ids"], inputs["input_mask"])
         confidence = inputs["conf"]
         # # Compute the KL divergence between the model and the reference model
         if self.beta != 0.0:
@@ -1624,22 +1507,28 @@ class MDPOTrainer(Trainer):
             per_token_kl = logr ** 2 / 2
 
         # Compute the loss
-        completion_mask = inputs["input_ids"][:, -logits_to_keep:] == 126336
-        lambda_t = logits_to_keep / (completion_mask.sum(dim=-1, keepdim=True) + 1e-4)
+        completion_mask = inputs["input_ids"] == self.processing_class.mask_token_id
+        completion_mask = completion_mask[:, -self.max_completion_length:]
+        lambda_t = self.max_completion_length / (completion_mask.sum(dim=-1, keepdim=True) + 1e-4)
 
         # # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's computation (see
         # # _generate_and_score_completions) and use per_token_logps.detach() instead.
         old_per_token_logps = inputs["old_per_token_logps"] if self.num_iterations > 1 else per_token_logps.detach()
         coef_1 = torch.exp(per_token_logps - old_per_token_logps)
         coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
-        per_token_loss1 = coef_1 * inputs["advantages"][:, -logits_to_keep:]
-        per_token_loss2 = coef_2 * inputs["advantages"][:, -logits_to_keep:]
+        per_token_loss1 = coef_1 * inputs["advantages"]
+        per_token_loss2 = coef_2 * inputs["advantages"]
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2) * lambda_t
         if self.beta != 0.0:
             per_token_loss = per_token_loss + self.beta * per_token_kl
         if confidence is None:
             confidence = torch.ones_like(per_token_loss)
         # loss = (per_token_loss * completion_mask).sum() / (completion_mask.sum() + 1e-4)
+        if model.module.config.model_type == "Dream":
+            per_token_loss = torch.cat([per_token_loss[:, 1:], per_token_loss[:, -1:]], dim=1)
+            completion_mask = torch.cat([completion_mask[:, 1:], completion_mask[:, :1]], dim=1)
+            completion_mask[:, -1] = 0
+            confidence = torch.cat([confidence[:, 1:], confidence[:, :1]], dim=1)
         loss = (per_token_loss * completion_mask * confidence).sum() / (completion_mask.sum() + 1e-4)
         # Log the metrics
         mode = "eval" if self.control.should_evaluate else "train"
@@ -1679,20 +1568,24 @@ class MDPOTrainer(Trainer):
                 prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
                 prompt_ids = prompt_ids.to(self.accelerator.device)
                 prompt_mask = prompt_mask.to(self.accelerator.device)
-                with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
-                    all_steps_input_ids, all_steps_output_completion_ids, _ = generate(unwrapped_model,
+                with (unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model):
+                    _, all_steps_output_completion_ids, _, all_steps_input_ids = diffusion_generate(unwrapped_model,
                                                                                        prompt_ids,
-                                                                                       prompt_mask,
-                                                                                       tokenizer=self.processing_class,
+                                                                                       prompt_mask=prompt_mask,
                                                                                        steps=diffusion_steps,
                                                                                        gen_length=self.max_completion_length,
                                                                                        block_length=block_length,
-                                                                                       temperature=0.0, cfg_scale=0.,
-                                                                                       remasking="low_confidence",
+                                                                                       temperature=0.0,
                                                                                        mask_id=self.processing_class.mask_token_id,
-                                                                                       overtime_conf=self.args.overtime_conf)
+                                                                                       conf_alg=self.args.conf_alg,
+                                                                                       rcr=self.args.rcr,
+                                                                                       top_k=self.args.top_k, top_p=self.args.top_p)
                 # Compute prompt length and extract completion ids
-                intermediate_answers = self.processing_class.batch_decode(torch.cat(all_steps_output_completion_ids, dim=0),
+                cat_all_steps_output_completion_ids = torch.cat(all_steps_output_completion_ids, dim=0)
+                # replace out vocab token with eos here becauseof this issue https://github.com/DreamLM/Dream/issues/54
+                cat_all_steps_output_completion_ids = torch.where(cat_all_steps_output_completion_ids >= len(self.processing_class),
+                                             self.processing_class.eos_token_id, cat_all_steps_output_completion_ids)
+                intermediate_answers = self.processing_class.batch_decode(cat_all_steps_output_completion_ids,
                                            skip_special_tokens=True)
                 # print(f"Question {problem_index} is {str(answer_correct)}")
                 # intermediate_correct = False
@@ -1721,13 +1614,16 @@ class MDPOTrainer(Trainer):
             )
             prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
             with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
-                all_steps_input_ids, all_steps_output_completion_ids, _ = generate(unwrapped_model,
-                 prompt_ids.to(unwrapped_model.device), prompt_mask.to(unwrapped_model.device),
-                 tokenizer=self.processing_class, steps=self.args.diffusion_steps, gen_length=self.max_completion_length,
-                 block_length=self.args.block_length, temperature=0.0, cfg_scale=0.,
-                 remasking="low_confidence", mask_id=self.processing_class.mask_token_id, overtime_conf=self.args.overtime_conf)
+                completion_ids, _, _, _ = diffusion_generate(unwrapped_model,
+                 prompt_ids.to(unwrapped_model.device), prompt_mask=prompt_mask.to(unwrapped_model.device),
+                 steps=self.args.diffusion_steps, gen_length=self.max_completion_length,
+                 block_length=self.args.block_length, temperature=0.0,
+                 conf_alg=self.args.conf_alg, mask_id=self.processing_class.mask_token_id, rcr=self.args.rcr,
+                 top_k=self.args.top_k, top_p=self.args.top_p)
+            # replace out vocab token with eos here becauseof this issue https://github.com/DreamLM/Dream/issues/54
+            completion_ids = torch.where(completion_ids >= len(self.processing_class),
+                                         self.processing_class.eos_token_id, completion_ids)
             # Compute prompt length and extract completion ids
-            completion_ids = all_steps_output_completion_ids[-1]
             model_answer = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)[0]
             answer_correct = self.eval_dataloader.dataset.verify_fn(model_answer, solution, question=batch.get("question", [None])[0])
             if answer_correct:

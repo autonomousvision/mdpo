@@ -196,12 +196,6 @@ class MDPOConfig(TrainingArguments):
             "help": "Number of total diffusion steps, usually in the range of [64, 256]."
         },
     )
-    remask_strategy: str = field(
-        default="low_confidence",
-        metadata={
-            "help": "low_confidence or random"
-        },
-    )
     overtime_conf: bool = field(
         default=False,
         metadata={
@@ -282,3 +276,7 @@ class MDPOConfig(TrainingArguments):
             "installed, it prints the sample. If `wandb` logging is enabled, it logs it to `wandb`."
         },
     )
+    rcr: bool = field(default=False, metadata={"help": "Whether to use RCR for sampling."})
+    conf_alg: str = field(default="llada", metadata={"help": "The confidence estimation algorithm to use. Choose from random, llada, topk_margin, and entropy"})
+    top_k: int = field(default=None, metadata={"help": "The top k results to use."})
+    top_p: float = field(default=None, metadata={"help": "The top-p value to use."})

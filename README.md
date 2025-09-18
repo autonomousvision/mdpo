@@ -45,7 +45,7 @@ CC=${gcc path} CUDA_HOME=${CUDA_HOME} CXX=${g++ path} accelerate launch --config
 --sample_train_steps 8 
 --max_prompt_length 320 
 --diffusion_steps 128 
---remask_strategy low_confidence 
+--conf_alg llada 
 --num_train_samples 40000 
 --system_prompt "Let's think step by step and output the final answer within \\boxed{}."
 --incremental_training true

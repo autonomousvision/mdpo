@@ -47,13 +47,14 @@ from src.open_r1.utils.callbacks import get_callbacks
 from src.open_r1.utils.wandb_logging import init_wandb_training
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 from llada.modeling_llada import LLaDAModelLM
+from src.dream import DreamModel
 import deepspeed
 deepspeed.ops.op_builder.CPUAdamBuilder().load()
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class GRPOScriptArguments(ScriptArguments):
+class MDPOScriptArguments(ScriptArguments):
     """
     Script arguments for the GRPO training script.
 
@@ -171,7 +172,6 @@ def main(script_args, training_args, model_args):
     # Load tokenizer
     ################
     tokenizer = get_tokenizer(model_args, training_args)
-    tokenizer.mask_token_id = 126336 #fixed
     # tokenizer.pad_token_id = tokenizer.mask_token_id
     # Get reward functions
     REWARD_FUNCS_REGISTRY = {
@@ -340,8 +340,14 @@ def main(script_args, training_args, model_args):
         torch_dtype=torch_dtype,
         cache_dir="./cache"
     )
-
-    model = LLaDAModelLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+    if "llada" in model_args.model_name_or_path.lower():
+        MODEL_MODULE = LLaDAModelLM
+        tokenizer.mask_token_id = 126336  # fixed
+    elif "dream" in model_args.model_name_or_path.lower():
+        MODEL_MODULE = DreamModel
+    else:
+        raise NotImplementedError(f"Model {model_args.model_name_or_path} not supported yet")
+    model = MODEL_MODULE.from_pretrained(model_args.model_name_or_path, **model_kwargs)
     if script_args.lora:
         peft_config = LoraConfig(
             task_type=script_args.peft_task_type,
@@ -427,6 +433,6 @@ def main(script_args, training_args, model_args):
 
 
 if __name__ == "__main__":
-    parser = TrlParser((GRPOScriptArguments, MDPOConfig, ModelConfig))
+    parser = TrlParser((MDPOScriptArguments, MDPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     main(script_args, training_args, model_args)
