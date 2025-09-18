@@ -1245,17 +1245,17 @@ class MDPOTrainer(Trainer):
             for _ in range(total_updates):
                 update_step += 1
                 # Evaluation every 100 step
-                # if update_step % 100 == 0:
-                #     # pass
-                #     correct_per_rank = self.evaluate()
-                #     dist.barrier()
-                #     cpu_pg = dist.new_group(backend="gloo")  # 1-line fix
-                #     world_size = dist.get_world_size()
-                #     gathered_corrects = [None] * world_size if dist.get_rank() == 0 else None
-                #     dist.gather_object(correct_per_rank, gathered_corrects, dst=0, group=cpu_pg)
-                #     if dist.get_rank() == 0:
-                #         wandb.log({"eval/accuracy": sum([len(corrects) for corrects in gathered_corrects]) / len(self.eval_dataset)})
-                #     dist.destroy_process_group(cpu_pg)
+                if update_step % 100 == 0:
+                    # pass
+                    correct_per_rank = self.evaluate()
+                    dist.barrier()
+                    cpu_pg = dist.new_group(backend="gloo")  # 1-line fix
+                    world_size = dist.get_world_size()
+                    gathered_corrects = [None] * world_size if dist.get_rank() == 0 else None
+                    dist.gather_object(correct_per_rank, gathered_corrects, dst=0, group=cpu_pg)
+                    if dist.get_rank() == 0:
+                        wandb.log({"eval/accuracy": sum([len(corrects) for corrects in gathered_corrects]) / len(self.eval_dataset)})
+                    dist.destroy_process_group(cpu_pg)
                 num_batches = args.gradient_accumulation_steps if update_step != (total_updates - 1) else remainder
                 batch_samples, num_items_in_batch = self.get_batch_samples(epoch_iterator, num_batches)
                 for i, batch in enumerate(batch_samples):
@@ -1389,18 +1389,18 @@ class MDPOTrainer(Trainer):
                     if is_torch_xla_available():
                         xm.mark_step()
                     break
-            # if epoch == (num_train_epochs - 1):
-            #     # pass
-            #     correct_per_rank = self.evaluate()
-            #     dist.barrier()
-            #     cpu_pg = dist.new_group(backend="gloo")  # 1-line fix
-            #     world_size = dist.get_world_size()
-            #     gathered_corrects = [None] * world_size if dist.get_rank() == 0 else None
-            #     dist.gather_object(correct_per_rank, gathered_corrects, dst=0, group=cpu_pg)
-            #     if dist.get_rank() == 0:
-            #         wandb.log({"eval/accuracy": sum([len(corrects) for corrects in gathered_corrects]) / len(
-            #             self.eval_dataset)})
-            #     dist.destroy_process_group(cpu_pg)
+            if epoch == (num_train_epochs - 1):
+                # pass
+                correct_per_rank = self.evaluate()
+                dist.barrier()
+                cpu_pg = dist.new_group(backend="gloo")  # 1-line fix
+                world_size = dist.get_world_size()
+                gathered_corrects = [None] * world_size if dist.get_rank() == 0 else None
+                dist.gather_object(correct_per_rank, gathered_corrects, dst=0, group=cpu_pg)
+                if dist.get_rank() == 0:
+                    wandb.log({"eval/accuracy": sum([len(corrects) for corrects in gathered_corrects]) / len(
+                        self.eval_dataset)})
+                dist.destroy_process_group(cpu_pg)
             if step < 0:
                 logger.warning(
                     "There seems not to be a single sample in your epoch_iterator, stopping training at step"
