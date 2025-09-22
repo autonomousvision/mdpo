@@ -92,7 +92,6 @@ if __name__ == '__main__':
     parser.add_argument("--gen_length", type=int, default=512)
     parser.add_argument("--model_path", default="GSAI-ML/LLaDA-8B-Instruct")
     parser.add_argument("--lora_path", default=None, type=str)
-    parser.add_argument("--model_type", default="dlm")
     parser.add_argument("--mode", default="linear", choices=["linear", "cosine", "pow2", "pow3", "pow0.5", "log", "exp"])
     parser.add_argument("--log_visualizations", default=False, action="store_true")
     parser.add_argument("--rcr", default=False, action="store_true")
@@ -107,19 +106,16 @@ if __name__ == '__main__':
     except Exception as e:
         print(e)
         tokenizer = AutoTokenizer.from_pretrained("GSAI-ML/LLaDA-8B-Instruct", trust_remote_code=True, cache_dir="./cache")
-    if args.model_type == "dlm":
-        if "llada" in args.model_path.lower():
-            MODEL_MODULE = LLaDAModelLM
-        elif "dream" in args.model_path.lower():
-            MODEL_MODULE = DreamModel
-        else:
-            raise NotImplementedError(f"Model {args.model_path} not supported yet")
-        model = MODEL_MODULE.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16,
-                                          cache_dir="./cache", device_map=device)
-        if args.lora_path is not None:
-            model.load_adapter(args.lora_path)
+    if "llada" in args.model_path.lower():
+        MODEL_MODULE = LLaDAModelLM
+    elif "dream" in args.model_path.lower():
+        MODEL_MODULE = DreamModel
     else:
-        model = AutoModelForCausalLM.from_pretrained(args.model_path, cache_dir="./cache", torch_dtype=torch.bfloat16, device_map=device)
+        raise NotImplementedError(f"Model {args.model_path} not supported yet")
+    model = MODEL_MODULE.from_pretrained(args.model_path, trust_remote_code=True, torch_dtype=torch.bfloat16,
+                                      cache_dir="./cache", device_map=device)
+    if args.lora_path is not None:
+        model.load_adapter(args.lora_path)
     if args.system_prompt_type == "format":
         system_prompt = "Let's first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer> and output the final answer within \\boxed{} inbetween the <answer> </answer> tags"
     elif args.system_prompt_type == "step_by_step":

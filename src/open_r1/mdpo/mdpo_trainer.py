@@ -1575,7 +1575,7 @@ class MDPOTrainer(Trainer):
                                                                                        steps=diffusion_steps,
                                                                                        gen_length=self.max_completion_length,
                                                                                        block_length=block_length,
-                                                                                       temperature=0.0,
+                                                                                       temperature=0.1 if unwrapped_model.config.model_type == "Dream" else 0.0,
                                                                                        mask_id=self.processing_class.mask_token_id,
                                                                                        conf_alg=self.args.conf_alg,
                                                                                        rcr=self.args.rcr,
@@ -1617,7 +1617,7 @@ class MDPOTrainer(Trainer):
                 completion_ids, _, _, _ = diffusion_generate(unwrapped_model,
                  prompt_ids.to(unwrapped_model.device), prompt_mask=prompt_mask.to(unwrapped_model.device),
                  steps=self.args.diffusion_steps, gen_length=self.max_completion_length,
-                 block_length=self.args.block_length, temperature=0.0,
+                 block_length=self.args.block_length, temperature=0.1 if unwrapped_model.config.model_type == "Dream" else 0.0,
                  conf_alg=self.args.conf_alg, mask_id=self.processing_class.mask_token_id, rcr=self.args.rcr,
                  top_k=self.args.top_k, top_p=self.args.top_p)
             # replace out vocab token with eos here becauseof this issue https://github.com/DreamLM/Dream/issues/54
