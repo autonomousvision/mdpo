@@ -178,3 +178,6 @@ eval_results/
 results/
 *.csv
 .vscode/
+.DS_Store
+.codebuddy/
+.idea/
