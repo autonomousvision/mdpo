@@ -446,7 +446,7 @@ class MDPOTrainer(Trainer):
             peft_config: Optional["PeftConfig"] = None,
             incremental_training: bool = False,
             mixture_data: bool = False,
-            ab_path: str = None,
+            od_path: str = None,
     ):
         # Args
         if args is None:
@@ -596,7 +596,7 @@ class MDPOTrainer(Trainer):
             optimizers=optimizers,
         )
         self.incremental_training = incremental_training
-        self.ab_path = ab_path
+        self.od_path = od_path
         self.mixture_data = mixture_data
         self.current_data = []
         if incremental_training:
@@ -1160,8 +1160,8 @@ class MDPOTrainer(Trainer):
 
         for epoch in range(epochs_trained, num_train_epochs):
             if self.incremental_training:
-                if epoch == 0 and self.ab_path is not None and os.path.exists(self.ab_path):
-                    ab_data = pd.read_csv(self.ab_path)
+                if epoch == 0 and self.od_path is not None and os.path.exists(self.od_path):
+                    ab_data = pd.read_csv(self.od_path)
                     self.current_data = []
                     for row in range(ab_data.shape[0]):
                         self.current_data.append({"prompt": [{"role": "user", "content": ab_data.loc[row, "Problem"]}],

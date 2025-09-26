@@ -121,7 +121,7 @@ class MDPOScriptArguments(ScriptArguments):
     num_train_samples: int = field(default=3000, metadata={"help": "Number of training samples"})
     incremental_training: bool = field(default=False, metadata={"help": "Whether incrementally select ICFW data"})
     mixture_data: bool = field(default=False, metadata={"help": "Sample the data in a mixture of settings way"})
-    ab_path: str = field(default=None, metadata={"help": "Path to preprocessed answer backslide data"})
+    od_path: str = field(default=None, metadata={"help": "Path to preprocessed answer backslide data"})
 
 def main(script_args, training_args, model_args):
     # Set seed for reproducibility
@@ -377,7 +377,7 @@ def main(script_args, training_args, model_args):
         processing_class=tokenizer,
         incremental_training=script_args.incremental_training,
         mixture_data=script_args.mixture_data,
-        ab_path=script_args.ab_path
+        od_path=script_args.od_path
     )
 
     ###############

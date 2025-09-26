@@ -7,7 +7,7 @@ ddp_find_unused_parameters: false
 # Data training arguments
 dataset_name: open-r1/OpenR1-Math-220k #DigitalLearningGmbH/MATH-lighteval, camel-ai/amc_aime_self_improving, AI-MO/NuminaMath-TIR
 dataset_train_split: train
-ab_path: #path to the pre-computed answer backslide samples
+od_path: #path to the pre-computed answer backslide samples
 system_prompt: "Let's think step by step and output the final answer within \\boxed{}." #"Let's first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer> and output the final answer within \\boxed{} inbetween the <answer> </answer> tags" #"Let's think step by step and output the final answer within \\boxed{}."
 num_train_samples: 3000
 # GDPO trainer config
