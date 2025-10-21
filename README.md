@@ -5,7 +5,7 @@ The code is highly based on [Huggingface OpenR1](https://github.com/huggingface/
 ## 🌟Setup
 To prepare the environment, simply run 
 
-```conda create -n py39 python=3.9```
+```conda create -n dlm python=3.10```
 
 And then 
 ```CUDA_HOME=$YOUR_CUDA_HOME pip install -e .``` Here we need the CUDA_HOME for Deepspeed and Flashattention compilation.
