@@ -1,0 +1,24 @@
+PYTHONPATH=./src/ CC=/home/geiger/gwb130/.conda/envs/dlm/bin/x86_64-conda-linux-gnu-gcc CUDA_HOME=/home/geiger/gwb130/.conda/pkgs/cuda-nvcc-12.4.99-0/ CXX=/home/geiger/gwb130/.conda/envs/dlm/bin/x86_64-conda-linux-gnu-g++ accelerate launch --config_file recipes/accelerate_configs/zero2.yaml \
+--num_processes 1 src/open_r1/mdpo.py \
+    --config recipes/LLaDA-Instruct/mdpo/config_demo.yaml \
+    --dataset_train_split train \
+    --num_train_epochs 1 \
+    --dataset_name open-r1/OpenR1-Math-220k \
+    --save_strategy "epoch" \
+    --output_dir checkpoints/LLaDA-8B-Instruct-MDPO-numina-adv-mixture_data-128st-8sample_temp0.4_1gpus \
+    --num_generations 1 \
+    --learning_rate 7e-7 \
+    --gradient_accumulation_steps 8 \
+    --temperature 0.4 \
+    --beta 0.02 \
+    --block_length 512 \
+    --max_completion_length 512 \
+    --sample_train_steps 8 \
+    --max_prompt_length 320 \
+    --diffusion_steps 128 \
+    --conf_alg llada \
+    --num_train_samples 40000 \
+    --system_prompt "Let's think step by step and output the final answer within \\boxed{}." \
+    --incremental_training true \
+    --mixture_data true \
+    --od_path ab_samples/ab_from_40k_epoch_1.csv

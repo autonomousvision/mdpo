@@ -40,8 +40,6 @@ from transformers.trainer_utils import (
 )
 from transformers.modeling_utils import PreTrainedModel, load_sharded_checkpoint, unwrap_model
 from transformers.trainer_pt_utils import get_model_param_count
-
-from llada.generate import add_gumbel_noise, get_num_transfer_tokens
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled, deepspeed_init, deepspeed_load_checkpoint, is_deepspeed_available
 from transformers.utils import is_peft_available, is_accelerate_available, is_sagemaker_mp_enabled, is_torch_xla_available, logging, is_apex_available
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
@@ -69,8 +67,7 @@ from math_verify import LatexExtractionConfig, parse, verify
 from src.open_r1.utils.trainer_utils import profiling_context, CustomDistributedSampler
 import importlib.metadata
 from transformers.training_args import OptimizerNames, ParallelMode, TrainingArguments
-import numpy as np
-import torch.nn.functional as F
+from src.open_r1.rewards import code_reward
 from torch.utils.data import DataLoader
 if is_peft_available():
     from peft import PeftConfig, get_peft_model, PeftModel
@@ -766,7 +763,7 @@ class MDPOTrainer(Trainer):
             if self.mixture_data:
                 all_diffusion_steps, all_block_lengths = random.choice([(self.args.diffusion_steps, 128), (self.args.diffusion_steps, 512)])
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-        solutions_text = [i["solution"] for i in inputs]
+        solutions_text = [i.get("solution", "") for i in inputs]
         prompt_inputs = self.processing_class(
             text=prompts_text, return_tensors="pt", padding="max_length", padding_side="left", truncation=True, max_length=self.max_prompt_length,
         )
@@ -803,44 +800,54 @@ class MDPOTrainer(Trainer):
         all_rewards = []
         # last_block_steps = self.args.diffusion_steps // (
         #         self.args.max_completion_length // self.args.block_length)
-        for t_completion_ids in all_steps_output_completion_ids:
-            # replace out vocab token with eos here becauseof this issue https://github.com/DreamLM/Dream/issues/54
-            t_completion_ids = torch.where(t_completion_ids >= len(self.processing_class), self.processing_class.eos_token_id, t_completion_ids)
-            t_completions_texts = self.processing_class.batch_decode(t_completion_ids, skip_special_tokens=True)
-            t_completions = []
-            if is_conversational(inputs[0]):
-
-                for prompt, t_completions_text in zip(prompts, t_completions_texts):
-                    bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
-                    t_completions.append([{"role": "assistant", "content": bootstrap + t_completions_text}])
+        all_completion_ids = torch.cat(all_steps_output_completion_ids)
+        all_completion_ids = torch.where(all_completion_ids >= len(self.processing_class), self.processing_class.eos_token_id, all_completion_ids)
+        all_completion_texts = self.processing_class.batch_decode(all_completion_ids, skip_special_tokens=True)
+        # for t_completion_ids in all_steps_output_completion_ids:
+        #     # replace out vocab token with eos here becauseof this issue https://github.com/DreamLM/Dream/issues/54
+        #     t_completion_ids = torch.where(t_completion_ids >= len(self.processing_class), self.processing_class.eos_token_id, t_completion_ids)
+        #     t_completions_texts = self.processing_class.batch_decode(t_completion_ids, skip_special_tokens=True)
+        #     t_completions = []
+        #     if is_conversational(inputs[0]):
+        #         for prompt, t_completions_text in zip(prompts, t_completions_texts):
+        #             bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
+        #             t_completions.append([{"role": "assistant", "content": bootstrap + t_completions_text}])
+        #     else:
+        #         # To align with chat template so reward functions can parse
+        #         for prompt, t_completions_text in zip(prompts, t_completions_texts):
+        #             t_completions.append([{"content": prompt + t_completions_text}])
+        all_rewards = torch.zeros(len(prompts), diffusion_steps ,len(self.reward_funcs), device=device)
+        for i, (reward_func, reward_processing_class) in enumerate(
+                zip(self.reward_funcs, self.reward_processing_classes)
+        ):
+            if isinstance(reward_func,
+                          nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                reward_func_name = f"reward {reward_func.config._name_or_path.split('/')[-1]}"
             else:
-                # To align with chat template so reward functions can parse
-                for prompt, t_completions_text in zip(prompts, t_completions_texts):
-                    t_completions.append([{"content": prompt + t_completions_text}])
-            rewards_t = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
-            for i, (reward_func, reward_processing_class) in enumerate(
-                    zip(self.reward_funcs, self.reward_processing_classes)
-            ):
-                if isinstance(reward_func,
-                              nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-                    reward_func_name = f"reward {reward_func.config._name_or_path.split('/')[-1]}"
+                reward_func_name = reward_func.__name__
+            with profiling_context(self, reward_func_name):
+                if isinstance(
+                        reward_func, nn.Module
+                ):  # Module instead of PretrainedModel for compat with compiled models
+                    raise NotImplementedError
                 else:
-                    reward_func_name = reward_func.__name__
-                with profiling_context(self, reward_func_name):
-                    if isinstance(
-                            reward_func, nn.Module
-                    ):  # Module instead of PretrainedModel for compat with compiled models
-                        raise NotImplementedError
-                    else:
-                        # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                        keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                        reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-                        output_reward_func_t = reward_func(prompts=prompts, completions=t_completions,
-                                                           **reward_kwargs)
-                        rewards_t[:, i] = torch.tensor(output_reward_func_t, dtype=torch.float32, device=device)
-            all_rewards.append((rewards_t * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1, keepdim=True))
 
-        all_step_rewards = torch.cat(all_rewards, dim=-1)
+                    # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                    keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                    if reward_func_name in ["code_reward", "code_format_reward"]:
+                        verification_info = [i[0] for i in reward_kwargs["verification_info"]]
+                        rewards_all_steps = reward_func(all_completion_texts, verification_info = verification_info * diffusion_steps)
+                        all_rewards[:, :, i] = torch.tensor(rewards_all_steps, dtype=torch.float32, device=device).view((len(prompts), diffusion_steps))
+                    else:
+                        #TODO: implement this again
+                        pass
+                        # output_reward_func_t = reward_func(prompts=prompts, completions=t_completions,
+                        #                                    **reward_kwargs)
+                        # rewards_t[:, i] = torch.tensor(output_reward_func_t, dtype=torch.float32, device=device)
+                        # all_rewards.append((rewards_t * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1, keepdim=True))
+        all_step_rewards = (all_rewards * self.reward_weights.to(device).unsqueeze(0).unsqueeze(0)).nansum(dim=-1, keepdim=True).squeeze(-1)
+        # all_step_rewards = torch.cat(all_rewards, dim=-1)
         # adv-v1: single step reward
         # all_step_advantages = all_step_rewards
         # adv-v2: average reward following action t
@@ -859,8 +866,8 @@ class MDPOTrainer(Trainer):
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics[mode]["completion_length"].append(completion_length)
 
-        rewards_per_func = gather(rewards_t)
-        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+        rewards_per_func = gather(all_rewards[:, -1])
+        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=-1)
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
                 reward_func_name = reward_func.config._name_or_path.split("/")[-1]
@@ -1246,8 +1253,12 @@ class MDPOTrainer(Trainer):
                 update_step += 1
                 # Evaluation every 100 step
                 if update_step % 100 == 0:
-                    # pass
-                    correct_per_rank = self.evaluate()
+                    pass
+                    # TODO: flexible coding evaluation
+                    if self.eval_dataset.config_name == "sanitized":
+                        correct_per_rank = self.evaluate_coding()
+                    else:
+                        correct_per_rank = self.evaluate()
                     dist.barrier()
                     cpu_pg = dist.new_group(backend="gloo")  # 1-line fix
                     world_size = dist.get_world_size()
@@ -1391,7 +1402,10 @@ class MDPOTrainer(Trainer):
                     break
             if epoch == (num_train_epochs - 1):
                 # pass
-                correct_per_rank = self.evaluate()
+                if self.eval_dataset.config_name == "sanitized":
+                    correct_per_rank = self.evaluate_coding()
+                else:
+                    correct_per_rank = self.evaluate()
                 dist.barrier()
                 cpu_pg = dist.new_group(backend="gloo")  # 1-line fix
                 world_size = dist.get_world_size()
@@ -1628,6 +1642,40 @@ class MDPOTrainer(Trainer):
             answer_correct = self.eval_dataloader.dataset.verify_fn(model_answer, solution, question=batch.get("question", [None])[0])
             if answer_correct:
                 correct_per_rank.append(batch.get("unique_id", [1])[0])
+        return correct_per_rank
+    
+    def evaluate_coding(self):
+        from src.open_r1.utils.mbpp_evaluator import check_correctness
+        from src.open_r1.rewards import extract_code
+        correct_per_rank = []
+        for batch in tqdm(self.eval_dataloader, desc="Evaluation"):
+            prompt = batch["prompt"][0]
+            prompt += "Please include the code between special syntax```python and ```."
+            test_cases = [i[0] for i in batch["test_list"]]
+            m = [{"role": "user", "content": prompt}, ]
+            prompt = self.processing_class.apply_chat_template(m, add_generation_prompt=True, tokenize=False)
+            prompt_inputs = self.processing_class(
+                text=prompt, return_tensors="pt"
+            )
+            prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+            with unwrap_model_for_generation(self.model_wrapped, self.accelerator) as unwrapped_model:
+                completion_ids, _, _, _ = diffusion_generate(unwrapped_model,
+                 prompt_ids.to(unwrapped_model.device), prompt_mask=prompt_mask.to(unwrapped_model.device),
+                 steps=self.args.diffusion_steps, gen_length=self.max_completion_length,
+                 block_length=self.args.block_length, temperature=0.1 if unwrapped_model.config.model_type == "Dream" else 0.0,
+                 conf_alg=self.args.conf_alg, mask_id=self.processing_class.mask_token_id, rcr=self.args.rcr,
+                 top_k=self.args.top_k, top_p=self.args.top_p)
+            # replace out vocab token with eos here becauseof this issue https://github.com/DreamLM/Dream/issues/54
+            completion_ids = torch.where(completion_ids >= len(self.processing_class),
+                                         self.processing_class.eos_token_id, completion_ids)
+            # Compute prompt length and extract completion ids
+            model_answer = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)[0]
+            try:
+                answer_correct = check_correctness(extract_code(model_answer), test_cases)
+            except:
+                answer_correct = 0.0
+            if answer_correct:
+                correct_per_rank.append(batch.get("task_id", [1])[0].item())
         return correct_per_rank
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         mode = "eval" if self.control.should_evaluate else "train"

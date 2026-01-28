@@ -1,0 +1,20 @@
+PYTHONPATH=./src/ CC=/home/geiger/gwb130/.conda/envs/dlm/bin/x86_64-conda-linux-gnu-gcc CUDA_HOME=/home/geiger/gwb130/.conda/pkgs/cuda-nvcc-12.4.99-0/ CXX=/home/geiger/gwb130/.conda/envs/dlm/bin/x86_64-conda-linux-gnu-g++ accelerate launch --config_file recipes/accelerate_configs/zero2.yaml \
+--num_processes 8 src/open_r1/mdpo.py \
+    --config recipes/LLaDA-Instruct/mdpo/config_demo_code.yaml \
+    --dataset_train_split train \
+    --num_train_epochs 1 \
+    --dataset_name open-r1/verifiable-coding-problems-python \
+    --save_strategy "epoch" \
+    --output_dir checkpoints/LLaDA-8B-Instruct-MDPO-coding-adv-mixture_data-128st-block128-8sample_temp0.4_8gpus \
+    --num_generations 8 \
+    --learning_rate 7e-7 \
+    --gradient_accumulation_steps 8 \
+    --temperature 0.4 \
+    --beta 0.02 \
+    --block_length 128 \
+    --max_completion_length 512 \
+    --sample_train_steps 8 \
+    --max_prompt_length 512 \
+    --diffusion_steps 128 \
+    --conf_alg llada \
+    --num_train_samples 10000

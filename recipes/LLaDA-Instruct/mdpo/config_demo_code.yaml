@@ -3,52 +3,65 @@ model_name_or_path: GSAI-ML/LLaDA-8B-Instruct
 model_revision: main
 torch_dtype: bfloat16
 trust_remote_code: true
-
+ddp_find_unused_parameters: false
 # Data training arguments
-dataset_name: open-r1/verifiable-coding-problems-python
-system_prompt: "You are a helpful AI Assistant that provides well-reasoned and detailed responses. You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>"
-
-# GRPO trainer config
-beta: 0.01
+dataset_name: open-r1/verifiable-coding-problems-python #DigitalLearningGmbH/MATH-lighteval, camel-ai/amc_aime_self_improving, AI-MO/NuminaMath-TIR
+dataset_train_split: train
+od_path: #path to the pre-computed answer backslide samples
+system_prompt: "Please include the code between special syntax ```python and ```."
+num_train_samples: 30000
+# GDPO trainer config
 bf16: true
-max_prompt_length: 1024
-max_completion_length: 2048
+save_only_model: true
+#Lora
+lora: false
+lora_r: 128
+lora_alpha: 64
+lora_dropout: 0.05
+peft_task_type: CAUSAL_LM
+#Diffusion and GDPO
+max_prompt_length: 256
+max_completion_length: 512
 diffusion_steps: 128
-block_length: 2048
+sample_train_steps: 16
+overtime_conf: false
+block_length: 512
+incremental_training: false
+mixture_data: false
+
+temperature: 0.1
 do_eval: false
-gradient_accumulation_steps: 4
+beta: 0.0
+gradient_accumulation_steps: 32
 gradient_checkpointing: false
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: LLaDA-8B-Instruct-Code-MDPO
+hub_model_id: LLaDA-8B-Instruct-MDPO-code
 hub_strategy: every_save
-learning_rate: 5.0e-06
+learning_rate: 1.0e-05
 log_completions: true
 log_level: info
 logging_first_step: true
-logging_steps: 1
+logging_steps: 2
 logging_strategy: steps
-lr_scheduler_type: cosine_with_min_lr
-lr_scheduler_kwargs:
-  min_lr_rate: 0.1
-max_steps: 500
-num_generations: 14
+lr_scheduler_type: constant #cosine
+max_steps: -1
+num_generations: 4
 num_train_epochs: 1
-output_dir: data/LLaDA-8B-Instruct-Code-MDPO
+output_dir: data/LLaDA-8B-Instruct-MDPO-code
 overwrite_output_dir: true
-per_device_train_batch_size: 16
-push_to_hub: true
+per_device_eval_batch_size: 1
+per_device_train_batch_size: 1
+push_to_hub: false
 report_to:
 - wandb
 reward_funcs:
 - code
-- format
+- code_format
 reward_weights:
 - 1.0
-- 0.1
-save_strategy: "steps"
-save_steps: 50
+- 1.0
+save_strategy: "epoch"
 save_total_limit: 1
 seed: 42
-temperature: 1.0
-warmup_ratio: 0.03
+warmup_ratio: 0.1

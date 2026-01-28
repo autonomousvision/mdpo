@@ -46,7 +46,7 @@ from src.open_r1.utils import get_tokenizer
 from src.open_r1.utils.callbacks import get_callbacks
 from src.open_r1.utils.wandb_logging import init_wandb_training
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
-from llada.modeling_llada import LLaDAModelLM
+from src.llada.modeling_llada import LLaDAModelLM
 from src.dream import DreamModel
 import deepspeed
 deepspeed.ops.op_builder.CPUAdamBuilder().load()
@@ -213,6 +213,7 @@ def main(script_args, training_args, model_args):
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
     is_countdown = "countdown" in script_args.dataset_name.lower()
     is_sudoku = "sudoku" in script_args.dataset_name.lower()
+    is_coding = "coding" in script_args.dataset_name.lower()
     # Format into conversation
     def make_conversation(example):
         prompt = []
@@ -226,6 +227,42 @@ def main(script_args, training_args, model_args):
             prompt.append({"role": "user", "content": example["problem"]})
             return {"prompt": prompt}
 
+    def make_coding_conversation(example):
+        prompt = []
+        # 1. Handle System Prompt
+        if training_args.system_prompt is not None:
+            example["problem_statement"] += ("\n" + training_args.system_prompt)
+
+        # 2. Handle Base Model Case
+        if "Base" in tokenizer.name_or_path:
+            # Crucial: Always return the same keys. 
+            # Return an empty list for verification_info instead of missing key.
+            return {
+                "prompt": example["problem_statement"],
+                "verification_info": []
+            }
+
+        # 3. Handle Instruct Model Case
+        else:
+            prompt.append({"role": "user", "content": example["problem_statement"]})
+
+            # --- THE FIX IS HERE ---
+            raw_info = example.get("verification_info")
+
+            # Check if it is None or empty
+            if raw_info is None:
+                safe_verification_info = []  # Return empty list, NOT [None]
+            else:
+                # Optional: If your data is mixed (some strings, some dicts),
+                # force it to string to prevent further crashes:
+                if not isinstance(raw_info, str):
+                    raw_info = json.dumps(raw_info)
+                safe_verification_info = [raw_info]
+
+            return {
+                "prompt": prompt,
+                "verification_info": safe_verification_info
+            }
     def make_sudoku_conversation(example):
         prompt = []
         solution = example["Solution"]
@@ -246,7 +283,6 @@ def main(script_args, training_args, model_args):
             problem = training_args.system_prompt + "\n\n" + problem
         prompt.append({"role": "user", "content": problem})
         return {"prompt": prompt, "problem": problem, "solution": [{"nums": example['nums'], "target": example['target']}]}
-
     if script_args.dataset_name == "camel-ai/amc_aime_self_improving":
         dataset[script_args.dataset_train_split] = dataset[script_args.dataset_train_split].rename_column("groud_truth_solution", "solution")
         include_idx = list(range(len(dataset[script_args.dataset_train_split])))
@@ -275,9 +311,13 @@ def main(script_args, training_args, model_args):
         dataset_mapping_fn = make_countdown_conversation
     elif is_sudoku:
         dataset_mapping_fn = make_sudoku_conversation
+    elif is_coding:
+        dataset_mapping_fn = make_coding_conversation
     else:
         dataset_mapping_fn = make_conversation
-    dataset = dataset.map(dataset_mapping_fn, keep_in_memory=True)
+    dataset = dataset.map(dataset_mapping_fn, keep_in_memory=True, remove_columns=dataset.column_names if is_coding else None)
+    if is_coding:
+        dataset = dataset.filter(lambda x: x["verification_info"] is not [])
     # Evaluation dataset processing
     if is_sudoku:
         eval_dataset = datasets.Dataset.from_csv("eval/dataset/4x4_test_sudoku.csv", keep_in_memory=True, split=script_args.dataset_train_split, cache_dir="./cache", features=datasets.Features({"Puzzle": datasets.Value("string"), "Solution": datasets.Value("string")}))
@@ -313,6 +353,8 @@ def main(script_args, training_args, model_args):
         dataset_filtered = dataset.filter(lambda ex: make_key(ex, columns_to_check) not in duplicates)
         logger.info(f"*** After filter out the samples in test set, {len(dataset_filtered)} samples are left ***")
         dataset = dataset_filtered
+    elif is_coding:
+        eval_dataset = load_dataset("mbpp", "sanitized", split="test")
     else:
         eval_dataset = load_dataset("HuggingFaceH4/MATH-500", cache_dir="./cache")["test"]
         # eval_dataset = eval_dataset.select(range(100, 150))

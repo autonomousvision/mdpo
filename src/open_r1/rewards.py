@@ -2,14 +2,22 @@ import asyncio
 import json
 import math
 import re
-from typing import Dict
+from typing import Dict, Literal, List, Optional
 
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 from eval.parser_helper import remove_boxed, last_boxed_only_string
 from .utils import is_e2b_available
-
-
+from .utils.code_providers import get_provider
+from .utils.competitive_programming import (
+    SubtaskResult,
+    add_includes,
+    get_morph_client_from_env,
+    get_piston_client_from_env,
+)
+from .utils.competitive_programming import patch_code as cf_patch_code
+from .utils.competitive_programming import score_submission as cf_score_submission
+from .utils.competitive_programming import score_subtask
 if is_e2b_available():
     from dotenv import load_dotenv
     from e2b_code_interpreter import AsyncSandbox
@@ -417,27 +425,165 @@ def get_repetition_penalty_reward(ngram_size: int, max_penalty: float):
 
     return repetition_penalty_reward
 
+def _init_event_loop():
+    """Initialize or get the current event loop."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop
 
-def extract_code(completion: str) -> str:
-    pattern = re.compile(r"```python\n(.*?)```", re.DOTALL)
+def ioi_code_reward(completions, test_batch_size: int = 1, provider_type: str = "piston", **kwargs) -> list[float]:
+    """Reward function that evaluates IOI problems using a specified execution client.
+
+    Assumes the dataset has the same format as hf.co/datasets/open-r1/ioi
+
+    Args:
+        completions: List of model completions to evaluate
+        test_batch_size: Evaluate these many test cases in parallel, then check if any of them failed (0 score):
+                       if so stop evaluating; otherwise continue with the next batch of test cases.
+        provider_type: The execution provider to use (default: "piston"). Supported values: "piston", "morph"
+        **kwargs: Additional arguments passed from the dataset
+    """
+    # Get the appropriate client based on provider_type
+    if provider_type == "morph":
+        execution_client = get_morph_client_from_env()
+    else:
+        # for info on setting up piston workers, see slurm/piston/README.md
+        execution_client = get_piston_client_from_env()
+
+    code_snippets = [
+        # note: grading is automatically skipped if no code is extracted
+        add_includes(extract_code(completion[-1]["content"], "cpp"), problem_id)
+        for completion, problem_id in zip(completions, kwargs["id"])
+    ]
+
+    async def run_catch_exceptions(task):
+        try:
+            return await task
+        except Exception as e:
+            print(f"Error from {provider_type} worker: {e}")
+            return SubtaskResult()
+
+    problems_data = [dict(zip(kwargs.keys(), values)) for values in zip(*kwargs.values())]
+
+    loop = _init_event_loop()
+    evals = [
+        loop.create_task(
+            run_catch_exceptions(
+                score_subtask(
+                    execution_client,
+                    problem_data,
+                    code,
+                    test_batch_size=test_batch_size,
+                )
+            )
+        )
+        for problem_data, code in zip(problems_data, code_snippets)
+    ]
+    results = loop.run_until_complete(asyncio.gather(*evals))
+
+    return [result.score for result in results]
+
+def cf_code_reward(
+    completions,
+    test_batch_size: int = 1,
+    patch_code: bool = False,
+    scoring_mode: Literal["pass_fail", "partial", "weighted_sum"] = "weighted_sum",
+    **kwargs,
+) -> list[float]:
+    """Reward function that evaluates Codeforces problems using Piston+our CF package.
+
+    Assumes the dataset has the same format as hf.co/datasets/open-r1/codeforces (verifiable-prompts subset)
+
+    test_batch_size: evaluate these many test cases in parallel, then check if any of them failed (0 score): if so stop evaluating; otherwise continue with the next batch of test cases.
+    """
+    # for info on setting up piston workers, see slurm/piston/README.md
+    piston_client = get_piston_client_from_env()
+
+    languages = kwargs["language"] if "language" in kwargs else [None] * len(completions)
+    code_snippets = [
+        # note: grading is automatically skipped if a problem has no tests
+        cf_patch_code(extract_code(completion[-1]["content"], language), language)
+        if patch_code
+        else extract_code(completion[-1]["content"], language)
+        for completion, language in zip(completions, languages)
+    ]
+
+    async def run_catch_exceptions(task):
+        try:
+            return await task
+        except Exception as e:
+            print(f"Error from Piston worker: {e}")
+            return None
+
+    # load problem data. undo separating kwargs by column
+    problems_data = [dict(zip(kwargs.keys(), values)) for values in zip(*kwargs.values())]
+
+    loop = _init_event_loop()
+    evals = [
+        loop.create_task(
+            run_catch_exceptions(
+                cf_score_submission(
+                    piston_client,
+                    problem_data,
+                    code,
+                    test_batch_size=test_batch_size,
+                    scoring_mode=scoring_mode,
+                    submission_language=problem_data.get("language", None),
+                )
+            )
+        )
+        for problem_data, code in zip(problems_data, code_snippets)
+    ]
+    results = loop.run_until_complete(asyncio.gather(*evals))
+
+    return results
+
+def extract_code(completion: str, language: str | None = "python") -> str:
+    if language is None:
+        return ""
+    pattern = re.compile(rf"```{language}\n(.*?)```", re.DOTALL)
     matches = pattern.findall(completion)
     extracted_answer = matches[-1] if len(matches) >= 1 else ""
     return extracted_answer
 
 
-def code_reward(completions, **kwargs) -> list[float]:
-    """Reward function that evaluates code snippets using the E2B code interpreter.
+def binary_code_reward(
+    completions,
+    num_parallel: int = 2,
+    provider_type: str = "e2b",
+    enforce_same_language: bool = False,
+    **kwargs,
+) -> list[float]:
+    rewards = code_reward(
+        completions,
+        num_parallel=num_parallel,
+        provider_type=provider_type,
+        enforce_same_language=enforce_same_language,
+        **kwargs,
+    )
+    BINARY_THRESHOLD = 0.99
 
-    Assumes the dataset contains a `verification_info` column with test cases.
-    """
-    if not is_e2b_available():
-        raise ImportError(
-            "E2B is not available and required for this reward function. Please install E2B with "
-            "`pip install e2b-code-interpreter` and add an API key to a `.env` file."
-        )
+    output = []
+    for reward in rewards:
+        if reward is None:
+            output.append(None)
+        else:
+            output.append(1.0 if reward > BINARY_THRESHOLD else 0.0)
 
-    # TODO: add support for other languages in E2B: https://e2b.dev/docs/code-interpreting/supported-languages
-    """Returns a reward function that evaluates code snippets in a sandbox."""
+    return output
+
+
+def code_reward(
+        completions,
+        num_parallel: int = 2,
+        provider_type: str = "local",
+        enforce_same_language: bool = False,
+        **kwargs,
+) -> list[float]:
+    """Reward function that evaluates code snippets using a code execution provider."""
     evaluation_script_template = """
     import subprocess
     import json
@@ -448,20 +594,29 @@ def code_reward(completions, **kwargs) -> list[float]:
         exec_timeout = 5
 
         for case in test_cases:
-            process = subprocess.run(
-                ["python3", "-c", code],
-                input=case["input"],
-                text=True,
-                capture_output=True,
-                timeout=exec_timeout
-            )
+            try:
+                process = subprocess.run(
+                    ["python3", "-c", code],
+                    input=case["input"],
+                    text=True,
+                    capture_output=True,
+                    timeout=exec_timeout
+                )
 
-            if process.returncode != 0:  # Error in execution
+                if process.returncode != 0:  # Error in execution
+                    continue
+
+                output = process.stdout.strip()
+
+                # Simple line-by-line comparison
+                all_correct = True
+                for line1, line2 in zip(output.split('\\n'), case['output'].split('\\n')):
+                    all_correct = all_correct and line1.strip() == line2.strip()
+
+                if all_correct:
+                    passed += 1
+            except Exception:
                 continue
-
-            output = process.stdout.strip()
-            if output.strip() == case["output"].strip():
-                passed += 1
 
         success_rate = (passed / total)
         return success_rate
@@ -469,70 +624,50 @@ def code_reward(completions, **kwargs) -> list[float]:
     code_snippet = {code}
     test_cases = json.loads({test_cases})
 
-    evaluate_code(code_snippet, test_cases)
+    print(evaluate_code(code_snippet, test_cases))
     """
-    code_snippets = [extract_code(completion[-1]["content"]) for completion in completions]
+
+    code_snippets = [extract_code(completion) for completion in completions]
     verification_info = kwargs["verification_info"]
+    # Template modification: Ensure we print the result for the sandbox to capture
+    template = evaluation_script_template
+    verification_info = [json.loads(i) for i in verification_info]
     scripts = [
-        evaluation_script_template.format(code=json.dumps(code), test_cases=json.dumps(json.dumps(info["test_cases"])))
+        template.format(code=json.dumps(code), test_cases=json.dumps(json.dumps(info["test_cases"])))
         for code, info in zip(code_snippets, verification_info)
     ]
-    try:
-        rewards = run_async_from_sync(scripts, verification_info["language"])
 
-    except Exception as e:
-        print(f"Error from E2B executor: {e}")
-        rewards = [0.0] * len(completions)
+    language = verification_info[0]["language"]
 
-    return rewards
+    if enforce_same_language:
+        all_same_language = all(v["language"] == language for v in verification_info)
+        if not all_same_language:
+            raise ValueError("All verification_info must have the same language", verification_info)
+    execution_provider = get_provider(
+        provider_type=provider_type,
+        num_parallel=num_parallel,
+        **kwargs,
+    )
+    execution_rewards = execution_provider.execute_scripts(scripts, ["python"] * len(scripts))
+    return execution_rewards
 
 
 def get_code_format_reward(language: str = "python"):
-    """Format reward function specifically for code responses.
-
-    Args:
-        language: Programming language supported by E2B https://e2b.dev/docs/code-interpreting/supported-languages
-    """
-    pattern = rf"^<think>\n.*?\n</think>\n<answer>\n.*?```{language}.*?```.*?\n</answer>$"
-
     def code_format_reward(completions, **kwargs):
-        completion_contents = [completion[0]["content"] for completion in completions]
-        matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
+        languages = kwargs["language"] if "language" in kwargs else [language] * len(completions)
+        completion_contents = [completion for completion in completions]
+        matches = [
+            re.match(
+                rf".*?```{sample_language}.*?```.*?",
+                content,
+                re.DOTALL | re.MULTILINE,
+            )
+            for content, sample_language in zip(completion_contents, languages)
+        ]
         return [1.0 if match else 0.0 for match in matches]
 
     return code_format_reward
 
-
-def run_async_from_sync(scripts: list[str], language: str) -> list[float]:
-    """Function wrapping the `run_async` function."""
-    # Create a new event loop and set it
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    try:
-        # Run the async function and get the result
-        rewards = loop.run_until_complete(run_async(scripts, language))
-    finally:
-        loop.close()
-
-    return rewards
-
-
-async def run_async(scripts: list[str], language: str) -> list[float]:
-    # Create the sandbox by hand, currently there's no context manager for this version
-    sbx = await AsyncSandbox.create(timeout=30, request_timeout=3)
-
-    # Create a list of tasks for running scripts concurrently
-    tasks = [run_script(sbx, script) for script in scripts]
-
-    # Wait for all tasks to complete and gather their results as they finish
-    results = await asyncio.gather(*tasks)
-    rewards = list(results)  # collect results
-
-    # Kill the sandbox after all the tasks are complete
-    await sbx.kill()
-
-    return rewards
 
 
 async def run_script(sbx, script: str, language: str) -> float:
